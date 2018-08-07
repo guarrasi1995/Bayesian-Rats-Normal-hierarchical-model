@@ -1,0 +1,781 @@
+---
+title: "SDS 2 Project"
+author: "Valerio Guarrasi"
+date: "4 giugno 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r message = FALSE}
+library(ggdag)
+library(rjags)
+library(nlme)
+library(lattice)
+library(LaplacesDemon)
+library(coda)
+library(ggmcmc)
+library(R2jags)
+```
+
+This model, by Gelfand et al (1990), concerns 30 young rats whose weights were measured weekly for five weeks. Part of the data is shown below, where $Y_{ij}$ is the weight (grams) of the ith rat measured at age $x_j$ (days from birth). $i\in\{1,2,...30\}$ $j\in\{1,2,...5\}$
+```{r}
+Data <- list(
+    N =   30,
+    T =    5,
+    Y =   structure(c(151, 145, 147, 155, 135, 159, 141, 159, 177, 134, 
+                160, 143, 154, 171, 163, 160, 142, 156, 157, 152, 154, 139, 146, 
+                157, 132, 160, 169, 157, 137, 153, 199, 199, 214, 200, 188, 210, 
+                189, 201, 236, 182, 208, 188, 200, 221, 216, 207, 187, 203, 212, 
+                203, 205, 190, 191, 211, 185, 207, 216, 205, 180, 200, 246, 249, 
+                263, 237, 230, 252, 231, 248, 285, 220, 261, 220, 244, 270, 242, 
+                248, 234, 243, 259, 246, 253, 225, 229, 250, 237, 257, 261, 248, 
+                219, 244, 283, 293, 312, 272, 280, 298, 275, 297, 350, 260, 313, 
+                273, 289, 326, 281, 288, 280, 283, 307, 286, 298, 267, 272, 285, 
+                286, 303, 295, 289, 258, 286, 320, 354, 328, 297, 323, 331, 305, 
+                338, 376, 296, 352, 314, 325, 358, 312, 324, 316, 317, 336, 321, 
+                334, 302, 302, 323, 331, 345, 333, 316, 291, 324), .Dim = c(30, 
+                                                                            5)),
+    x = c(8.0, 15.0, 22.0, 29.0, 36.0)
+)
+Data$x
+head(Data$Y)
+```
+
+A plot of the 30 growth curves suggests some evidence of downward curvature. I'll plot each rat as one line.
+```{r}
+## visual check on the results
+matplot(Data$x, t(Data$Y), type = "b", pch = 16, lty = 1)
+```
+
+lmList fits a linear model for each individual predicting weight (Y) from time (xj).
+```{r}
+Data.long <- data.frame(
+    xj=rep(c(8, 15, 22, 29, 36), each=30),
+    i=rep(1:30, 5),
+    Y=as.vector(Data$Y))
+
+lmfit <- lmList(Y ~ xj | i, Data.long[, ])
+```
+
+Show a summary of the output for five participants.
+```{r}
+summary(lmList(Y ~ xj | i, Data.long[Data.long$i %in% 1:5, ]))
+```
+
+Provide averages for the sample coefficients.
+```{r}
+c(
+    mean_alpha = mean(sapply(lmfit, function(X) coef(X)[1])), # mean of intercept
+    mean_beta = mean(sapply(lmfit, function(X) coef(X)[2])), # mean of slope
+    sd_alpha = sd(sapply(lmfit, function(X) coef(X)[1])), # sd of intercept
+    sd_beta = sd(sapply(lmfit, function(X) coef(X)[2])) # sd of slope
+    )
+```
+
+Lattice plot
+```{r plotrawdata}
+ggplot(Data.long, aes(xj, Y)) + geom_point(shape = 1) +
+     facet_wrap(~i)
+```
+
+The model is essentially a random effects linear growth curve:
+\[Y_{ij}\sim Norm(\mu_{ij},\tau_c)\]
+\[\mu_{ij}\sim\alpha_i+\beta_i(x_j-\bar{x})\]
+\[\tau_c\sim Gamma(0.001,0.001)\]
+\[\alpha_i\sim Norm(\alpha_c,\tau_{\alpha})\]
+\[\beta_i\sim Norm(\beta_c,\tau_{\beta})\]
+\[\alpha_c\sim Norm(0,10^{-4})\]
+\[\beta_c\sim Norm(0,10^{-4})\]
+\[\tau_{\alpha}\sim Gamma(0.001,0.001)\]
+\[\tau_{\beta}\sim Gamma(0.001,0.001)\]
+where $\bar{x} = 22$, and $\tau$ represents the precision (1/variance) of a normal distribution. We note the absence of a parameter representing correlation between $\alpha_i$ and $\beta_i$ unlike in the Birats model which does explicitly model the covariance between $\alpha_i$ and $\beta_i$. For now, we standardise the $x_j$'s around their mean to reduce dependence between $\alpha_i$ and $\beta_i$ in their likelihood: in fact for the full balanced data, complete independence is achieved. (Note that, in general, prior independence does not force the posterior distributions to be independent).
+
+$\alpha_c$, $\tau_{\alpha}$, $\beta_c$, $\tau_{\beta}$, $\tau_c$ are given independent "noninformative" priors, with two alternatives considered for $\tau_{\alpha}$ and $\tau_{\beta}$: prior 1 is uniform on the scale of the standard deviations  $\sigma_{\alpha}=1/\sqrt{\tau_{\alpha}}$ and $\sigma_{\beta}=1/\sqrt{\tau_{\beta}}$, and prior 2 is a $Gamma(0.001, 0.001)$ on the precisions $\tau_{\alpha}$ and $\tau_{\beta}$. Interest particularly focuses on the intercept at zero time (birth), denoted $\alpha_0 = \alpha_c - \beta_c*\bar{x}$.
+```{r}
+dagify(Y_ij~mu_ij, Y_ij~tau_c, tau_c~sigma, mu_ij~alpha_i,mu_ij~beta_i, mu_ij~x_j, alpha_i~alpha_c, alpha_i~tau_alpha, tau_alpha~sigma_alpha, beta_i~beta_c, beta_i~tau_beta, tau_beta~sigma_beta, alpha_0~beta_c, alpha_0~alpha_c)%>% ggdag(text_col = "red",node_size = 18)
+```
+
+# Specify and export BUGS model
+
+The data is balanced, so it is possible to treat the dependent variable $y$ as a matrix.
+Various transformations are applied to values to extract meaningful values. E.g., $\sigma = \frac{1}{\sqrt{\tau}}$.
+
+```{r export.bugs.model}
+modelstring <- "
+model {
+    # Model
+    for (i in 1:N) {
+        for (j in 1:T) {
+            mu[i, j] <- alpha[i] + beta[i] * (x[j] - x.bar);
+            Y[i,j] ~ dnorm(mu[i,j], tau.c)
+        }
+        alpha[i] ~ dnorm(alpha.c, tau.alpha);
+        beta[i]  ~ dnorm(beta.c, tau.beta);
+    }
+
+    # Priors
+    alpha.c   ~ dnorm(0, 1.0E-4);
+    beta.c    ~ dnorm(0, 1.0E-4);
+    tau.c     ~ dgamma(1.0E-3, 1.0E-3);
+    tau.alpha ~ dgamma(1.0E-3, 1.0E-3);
+    tau.beta  ~ dgamma(1.0E-3, 1.0E-3);
+
+    # Transformations
+    sigma.alpha  <- 1.0/sqrt(tau.alpha);
+    sigma.beta <- 1.0/sqrt(tau.beta);
+    sigma.c    <- 1.0/sqrt(tau.c);
+    x.bar    <- mean(x[]);
+    alpha0   <- alpha.c - beta.c*x.bar;
+}
+"
+
+writeLines(modelstring, "model.txt")
+```
+
+```{r}
+nb=50000 #burn-in
+nc= 2 #num chains
+ni = 100000 #num iterations
+nsim=ni-nb #num simulations
+
+set.seed(123)
+setwd(getwd())
+```
+
+```{r}
+## Name the JAGS parameters
+
+rats.params <- c("tau.c", "sigma.c", "alpha.c", "sigma.alpha", "sigma.beta", "tau.alpha", "tau.beta", "beta.c", "alpha0", "alpha", "beta")
+
+## Define the starting values for JAGS
+
+rats.inits <- function(){
+  list("alpha"=c(250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250), 
+       "beta"=c(6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6), 
+       "alpha.c"=c(150), "beta.c"=c(10), "tau.c"=c(1), "tau.alpha"=c(1), "tau.beta"=c(1))
+}
+
+## Fit the model in JAGS, having previously copied the BUGS model in my working directory
+ratJags <- jags(data=Data,
+                inits=rats.inits,
+                parameters.to.save = rats.params,
+                model.file="model.txt", 
+                n.chains=nc,
+                n.thin = 1,
+                n.iter=ni,
+                n.burnin =nb)
+#n.thin to save memory
+## If we wanted to specify different initial values for the different chains, specify:
+## inits = c() ???
+
+alphaVect = ratJags$BUGSoutput$mean$alpha
+betaVect = ratJags$BUGSoutput$mean$beta
+alphaC = as.vector(ratJags$BUGSoutput$mean$alpha.c)
+betaC = as.vector(ratJags$BUGSoutput$mean$beta.c)
+xBar = mean(Data$x)
+
+X = t(replicate(30, Data$x))
+plot(X,Data$Y, main='overall lin. reg.', ylab='weigth', xlab='days')
+abline(a = alphaC-betaC*xBar, b=betaC, lw=2, col ="red")
+```
+
+We can calculate the coeficient of determination for the regression of each rat.
+The coefficient of determination is the proportion of the variance in the dependent variable that is predictable from the independent variable(s). It provides a measure of how well observed outcomes are replicated by the model, based on the proportion of total variation of outcomes explained by the model. The most general definition of the coefficient of determination is: $R^2:=1-\frac{SS_{res}}{SS_{tot}}$, where the total sum of squares and the sum of squares of residuals are: $SS_{tot}=\sum_i(y_i-\bar{y})^2$, $SS_{res}=\sum_i(y_i-f_i)^2=\sum_ie_i^2$ ($f_i$ are the predicted values).
+```{r}
+calc_R2all_lin = function(Y,a,b,X,XBar){
+  R2tutti<-rep(0, 30)
+  R2tuttiNames<-rep(0, 30)
+  for (i in 1:30) {
+    SSreg = sum((Y[i,]-(a[i]+b[i]*(X-XBar)))^2)
+    SStot = sum((Y[i,]-mean(Y[i,]))^2)
+    R2tuttiNames[i] = paste('rat', i, sep = "")
+    R2tutti[i] = 1 - SSreg/SStot }
+  names(R2tutti) = R2tuttiNames
+  return(R2tutti)}
+```
+
+```{r}
+R2all = calc_R2all_lin(Data$Y,alphaVect,betaVect,Data$x,xBar)
+
+R2all
+```
+
+Then find the rat with the most linear behaviour.
+```{r}
+maxR2 = which.max(R2all)
+maxR2Value = max(R2all)
+i = unname(maxR2)
+
+print('the best fit is achieved for:')
+print(paste('rat_',i,sep = ""))
+```
+
+The rat 8 is then the rat with the best linear fit. Let's see the distribution of the chains that gave us alpha[8] and beta[8] on which the linear regression for rat 8 is achieved. We need to point out here that JAGS used 2 chains to estimate each parameter. We can plot 3 histograms in one single plot, where 2 are from the 2 different chain, and 1 is from a simulation where we merge the 2 chains.
+```{r}
+threeHistMY = function(chain1,chain2,chainAll,val1,val2,val3,booL,mode,stringa1,stringa2){
+  p1 <- hist(chain1,freq = F, breaks=75)
+  p2 <- hist(chain2,freq = F, breaks=75)
+  p3 <- hist(chainAll,freq = F, breaks=75)
+  plot(p3,col=rgb(1,0,0,1/3), main=stringa1,xlab=stringa2, freq = F)  
+  plot(p2,col=rgb(1,0.5,0,1/3),add=T,freq = F)  
+  plot(p1,col=rgb(0,0,1,1/3),add=T,freq = F)  
+  abline(v =val3,col='red',lw=4)
+  abline(v =val2,col='orange',lw=4)
+  abline(v =val1,col='blue',lw=4)
+  if (booL) {
+    abline(v =mode,col='green',lw=4) }}
+```
+
+Get Chains:
+```{r}
+alphaChain1 = ratJags$BUGSoutput$sims.matrix[1:nsim,1:30]
+alphaChain2 = ratJags$BUGSoutput$sims.matrix[(nsim+1):(nsim*2),1:30]
+alphaChain = ratJags$BUGSoutput$sims.matrix[,1:30]
+
+betaChain1 = ratJags$BUGSoutput$sims.matrix[1:nsim,32:61]
+betaChain2 = ratJags$BUGSoutput$sims.matrix[(nsim+1):(nsim*2),32:61]
+betaChain = ratJags$BUGSoutput$sims.matrix[,32:61]
+```
+
+Alpha:
+```{r}
+threeHistMY(alphaChain1[,i],alphaChain2[,i],alphaChain[,i],mean(alphaChain1[,i]),mean(alphaChain2[,i]),alphaVect[i],F,0,paste('all chains of alpha_',i,sep=""),paste('alpha_',i,sep=""))
+```
+
+Beta:
+```{r}
+threeHistMY(betaChain1[,i],betaChain2[,i],betaChain[,i],mean(betaChain1[,i]),mean(betaChain2[,i]),betaVect[i-1],F,0,paste('all chains of beta_',i,sep=""),paste('beta_',i,sep=""))
+```
+
+We can now finally plot the regression where we also plot the line with A and B, the usual estimator for linear regression. As we can see the 2 lines are really alike. For the unbiased estimator: $b = \frac{S_{xy}}{S_{xx}}$ and $a = \bar{y}-b\bar{x}$, where $S_{xy}=n\sum xy$ and $S_{xx}=n\sum x^2$.
+```{r}
+calc_A = function(Y,B,xBar) {
+  return(mean(Y)-B*xBar) }
+
+calc_B = function(X,Y,xBar,nu) {
+  Sxy = (sum(X*Y)-xBar*sum(Y))
+  Sxx = (sum(X^2)-nu*xBar^2)
+  return(Sxy/Sxx) }
+```
+
+```{r}
+n = names(maxR2)
+plot(Data$x,Data$Y[i,], main=n, ylab='weigth', xlab='days')
+abline(a = alphaVect[i]-betaVect[i]*xBar, b=betaVect[i], col='red', lty='dashed',lw=1)
+
+B = calc_B(Data$x,Data$Y[i,],xBar,length(Data$x))
+A = calc_A(Data$Y[i,],B,xBar)
+
+abline(a = A, b=B, col='blue', lty='dotted',lw=1)
+
+text(x=15,y=300,label ='red line : MCMC approximation')
+text(x=15,y=310,label ='blue line : unbiased estimator')
+```
+
+These are the 2 intercepts and slopes:
+```{r}
+A
+alphaVect[i]-betaVect[i]*xBar
+
+B
+betaVect[i]
+```
+
+As we did with the best fit, we can now also find the rat with the worst linear regression. Those
+are the results:
+```{r}
+minR2 = which.min(R2all)
+minR2Value = min(R2all)
+i = unname(minR2)
+
+print('the worst fit is achieved for:')
+print(paste('rat_',i,sep = ""))
+```
+
+Alpha:
+```{r}
+threeHistMY(alphaChain1[,i],alphaChain2[,i],alphaChain[,i],mean(alphaChain1[,i]),mean(alphaChain2[,i]),alphaVect[i],F,0,paste('all chains of alpha_',i,sep=""),paste('alpha_',i,sep=""))
+```
+
+Beta:
+```{r}
+threeHistMY(betaChain1[,i],betaChain2[,i],betaChain[,i],mean(betaChain1[,i]),mean(betaChain2[,i]),betaVect[i-1],F,0,paste('all chains of beta_',i,sep=""),paste('beta_',i,sep=""))
+```
+
+```{r}
+B = calc_B(Data$x,Data$Y[i,],xBar,length(Data$x))
+A = calc_A(Data$Y[i,],B,xBar)
+
+nameR = names(minR2)
+plot(Data$x,Data$Y[i,], main=nameR, ylab='weigth', xlab='days')
+abline(a = alphaVect[i]-betaVect[i]*xBar, b=betaVect[i], col='red', lty='dashed',lw=1)
+abline(a = A, b=B, col='blue', lty='dotted',lw=1)
+text(x=15,y=300,label ='red line : MCMC approximation')
+text(x=15,y=310,label ='blue line : unbiased estimator')
+```
+
+```{r}
+A
+alphaVect[i]-betaVect[i]*xBar
+
+B
+betaVect[i]
+```
+
+In the end we used MCMC method to approximate many parameters. Just considering $\alpha_i$ and $\beta_i$ we have 30 approximation each. Each of those approximation have an error equal to the variance of the approximation. Such variance cannot be computed but just estimated in the following way: 
+$E[(\hat{I_t}-I)^2]=Var(\hat{I_t})\simeq\hat{Var}(\hat{I_t})=\frac{1}{t}(\hat{\gamma_0}+2\sum_{k=1}^{t-1}\hat{\gamma_k})$
+$\hat{\gamma_k}=\frac{1}{t-k}\sum_{k=1}^{t-1}(X_i-\hat{I_t})(X_{i+k}-\hat{I_t})$
+I computed such estimate for each of the 30 $\alpha_i$ and each of the $\beta_i$, then I normalized by dividing the absolute value of such error for the used approximation and then I computed the mean value as follows: 
+$Err_{\alpha}=\frac{100}{30}\sum_{i}\frac{|\hat{Var}(\hat{I_{\alpha_i}})|}{\hat{I_{\alpha_i}}}= 0.063%$
+$Err_{\beta}=\frac{100}{30}\sum_{i}\frac{|\hat{Var}(\hat{I_{\beta_i}})|}{\hat{I_{\beta_i}}}= 0.019%$
+Anyway as we can see the behaviour for this rat is not linear and might be exponential. We then implement a model that is able to use and exponential expected value.
+
+## Diagnoses
+Print descriptive statistics of posterior densities for parameters
+```{r}
+## Generate MCMC object for analysis
+ratsfit.mcmc <- as.mcmc(ratJags)
+
+summary(ratsfit.mcmc)
+```
+
+The "summary" method for the "mcmc" class provides numeric summaries of the MCMC samples values for each variable.
+The Mean collumn provides something equivalent to a point estimate of the parameter of interest. It can serve a similar role as a least squares of maximum likelihood estimate in a frequentist analysis.
+The standard deviation (SD) is the standard deviation of sampled values from the posterior. It provides information about certainty to which the value of the variable is known.
+Naive and Time-Series Standard Error (SE) provide information about the standard error in estimating the posterior mean. Increasing the number of monitored iterations in the MCMC run should decrease this standard error. The "naive" standard error is the standard error of the mean, which captures simulation error of the mean rather than posterior uncertainty: $naiveSE=\frac{posteriorSD}{\sqrt{n}}$.
+The time-series version is arguably the more informative value. The time-series standard error adjusts the "naive" standard error for autocorrelation. If there is auto-correlation then each iteration does not provide an independent unit of information. In this case, the time-series SE adjusts for the non-indepndence of each iteration.
+The Quantiles tables  provides various quantile estimates. It defaults to useful values, but different quantiles can be specified. In particular, the 50th percentile corresponds to the median. And the 2.5 and 97.5 percentiles can be combined to form a $95\%$.
+
+If these standard errors are too large for your application, the you need to increase the value of the n.iter argument. Usually, n.iter = 1000 would be a bit low, n.iter = 1e5 would be more common, or even larger, but that takes too long for a demonstration.
+
+
+#Trace Plots and Density Plots
+```{r}
+plot(ratsfit.mcmc)
+```
+
+Trace plots provide useful diagnostic estimation:
+
+The trace plots show the value of a variable across the monitored iteractions of the MCMC chain. Trace plots can reveal auto-correlation which reduces the information provided by each iteration. Trace plots can  reveal inadequate burn-in when early. We can see whether our chain gets stuck in certain areas of the parameter space, which indicates bad mixing. If you specify to monitor multiple chains, then the trace plot will display each chain in a different colour.
+Density plots summarise the posterior density for each variable estimated based on the sampling of the variable in the MCMC chains. 
+
+#Assessing convergence
+From our theory of Markov chains, we expect our chains to eventually converge to the stationary distribution, which is also our target distribution. However, there is no guarantee that our chain has converged after M draws. How do we know whether our chain has actually converged? We can never be sure, but there are several tests we can do, both visual and statistical, to see if the chain appears to be converged.
+
+#Autocorrelation Plot
+```{r}
+#autocorr(ratsfit.mcmc[[1]]) # auto-correlation and cross-correlation 
+                       # values for each chain, parameter, and several lag values
+#Trellis plots
+acfplot(ratsfit.mcmc, layout= c(15,1)) # Auto-correlation plot fo each parameter, each chain, and varying lag count
+```
+
+Autocorr calculates the autocorrelation function for the Markov chain mcmc.obj at the lags given by lags. High autocorrelations within chains indicate slow mixing and, usually, slow convergence. It may be useful to thin out a chain with high autocorrelations before calculating summary statistics: a thinned chain may contain most of the information, but take up less space in memory. Re-running the MCMC sampler with a different parameterization may help to reduce autocorrelation. The lag k autocorrelation $\rho_k$ is the correlation between every draw and its kth lag: $\rho_k=\frac{\sum_{i=1}^{n-k}(x_i-\bar{x})(x_{i+k}-\bar{x})}{\sum_{i=1}^{n}(x_i-\bar{x})^2}$. We would expect the kth lag autocorrelation to be smaller as k increases. If autocorrelation is still relatively high for higher values of k, this indicates high degree of correlation between our draws and slow mixing.
+So it seems as though the chains have converged after our iterations.
+If you have single or multiple chains, a trace plot is another way assess convergence, by eye. This ought to look like a 'hairy centipede'.
+
+#Gelman-Rubin-Brooks plot
+This plot shows the evolution of Gelman and Rubin's shrink factor as the number of iterations increases.
+```{r}
+#gelman.diag(ratsfit.mcmc)
+gelman.plot(ratsfit.mcmc) # Requires 2 or more chains
+```
+
+Steps (for each parameter):
+1. Run m >= 2 chains of length 2n from overdispersed starting values.
+2. Discard the first n draws in each chain.
+3. Calculate the within-chain and between-chain variance.
+4. Calculate the estimated variance of the parameter as a weighted sum of the within-chain and between-chain variance.
+5. Calculate the potential scale reduction factor.
+
+Within Chain Variance:
+$W=\frac{1}{m}\sum_{j=1}{m}s_j^2$ where $s_j^2=\frac{1}{n-1}\sum_{i=1}^{n}(\theta_{ij}-\bar{\theta_j)^2}$. $s_j^2$ is just the formula for the variance of the jth chain. W is then just the mean of the variances of each chain. W likely underestimates the true variance of the stationary distribution since our chains have probably not reached all the points of the stationary distribution.
+
+Between Chain Variance:
+$B=\frac{n}{m-1}\sum_{j=1}^{m}(\bar{\theta_j}-\bar{\bar \theta})^2$ where $\bar{\bar \theta}=\frac{1}{m}\sum_{j=1}^{m}\bar{\theta_j}$, this is the variance of the chain means multiplied by n because each chain is based on n draws.
+
+Estimated Variance:
+We can then estimate the variance of the stationary distribution as a weighted average of W and B. $\hat{Var}(\theta)=(1-\frac{1}{n})W+\frac{1}{n}B$. Because of overdispersion of the starting values, this overestimates the true variance, but is unbiased if the starting distribution equals the stationary distribution (if starting values were not overdispersed).
+
+Potential Scale Reduction Factor:
+The potential scale reduction factor is: $\hat R=\sqrt{\frac{\hat{Var}(\theta)}{W}}$. When $\hat{R}$ is high (perhaps greater than 1.1 or 1.2), then we should run our chains out longer to improve convergence to the stationary distribution.
+If we have more than one parameter, then we need to calculate the potential scale reduction factor for each parameter.
+We should run our chains out long enough so that all the potential scale reduction factors are small enough.
+We can then combine the mn total draws from our chains to produce one chain from the stationary distribution.
+The results of the Gelman and Rubin diagnostic gives us the median potential scale reduction factor and its 97.5% quantile (the psrf is estimated with uncertainty because our chain lengths are finite).
+We also get a multivariate potential scale reduction factor that was proposed by Gelman and Brooks.
+
+#Geweke-Brooks plot
+The Geweke diagnostic takes two nonoverlapping parts (usually the first 0.1 and last 0.5 proportions) of the Markov chain and compares the means of both parts, using a difference of means test to see if the two parts of the chain are from the same distribution (null hypothesis).
+The test statistic is a standard Z-score with the standard errors adjusted for autocorrelation.
+```{r}
+#geweke.diag(ratsfit.mcmc[[1]])
+geweke.plot(ratsfit.mcmc[[1]])
+```
+
+A large number of Z-scores falling outside this interval suggests possible convergence failure.
+
+#Highest Posterior Density intervals
+A $(1-\alpha)\%$ HPD interval is a region that satisfies the following two conditions:
+  1.The posterior probability of that region is $(1-\alpha)\%$.
+  2.The minimum density of any point within that region is equal to or larger than the density of any point outside that region.
+The HPD is an interval in which most of the distribution lies.
+Highest Posterior Density (HPD) intervals for 90, 95, and 99 percent intervals assuming that the data is not severely multimodal.
+```{r hpdinterval}
+list(int90 = HPDinterval(ratsfit.mcmc[[1]], prob=.90),
+     int95= HPDinterval(ratsfit.mcmc[[1]], prob=.95),
+    int99= HPDinterval(ratsfit.mcmc[[1]], prob=.99))
+```
+
+#Raftery and Lewis's diagnostic 
+Suppose we want to measure some posterior quantile of interest q.
+If we define some acceptable tolerance r for q and a probability s of being within that tolerance, the Raftery and Lewis diagnostic will calculate the number of iterations N and the number of burn-ins M necessary to satisfy the specified conditions.
+The diagnostic was designed to test the number of iterations and burn-in needed by first running and testing shorter pilot chain.
+raftery.diag is a run length control diagnostic based on a criterion of accuracy of estimation of the quantile q. It is intended for use on a short pilot run of a Markov chain. The number of iterations required to estimate the quantile q to within an accuracy of +/- r with probability p is calculated. Separate calculations are performed for each variable within each chain.
+```{r}
+raftery.diag(ratsfit.mcmc)
+```
+
+M: number of burn-ins necessary
+N: number of iterations necessary in the Markov chain
+Nmin: minimum number of iterations for the "pilot" sampler
+I: dependence factor, interpreted as the proportional increase in the number of iterations attributable to serial dependence.
+High dependence factors (> 5) are worrisome and may be due to influential starting values, high correlations between coefficients, or poor mixing.
+The Raftery-Lewis diagnostic will differ depending on which quantile q you choose.
+Estimates tend to be conservative in that it will suggest more iterations than necessary.
+
+#Heidelberger and Welch's convergence diagnostic
+The Heidelberg and Welch diagnostic calculates a test statistic to accept or reject the null hypothesis that the Markov chain is from a stationary
+distribution.
+The diagnostic consists of two parts.
+First Part:
+1. Generate a chain of N iterations and define an $\alpha$ level.
+2. Calculate the test statistic on the whole chain. Accept or reject null hypothesis that the chain is from a stationary distribution.
+3. If null hypothesis is rejected, discard the first 10% of the chain. Calculate the test statistic and accept or reject null.
+4. If null hypothesis is rejected, discard the next 10% and calculate the test statistic.
+5. Repeat until null hypothesis is accepted or 50% of the chain is discarded. If test still rejects null hypothesis, then the chain fails the test and needs to be run longer.
+Second Part:
+If the chain passes the first part of the diagnostic, then it takes the part of the chain not discarded from the first part to test the second part.
+The halfwidth test calculates half the width of the $(1 ??? \alpha)\%$ credible interval around the mean.
+If the ratio of the halfwidth and the mean is lower than some $\epsilon$, then the chain passes the test. Otherwise, the chain must be run out longer.
+
+heidel.diag is a run length control diagnostic based on a criterion of relative accuracy for the estimate of the mean. The default setting corresponds to a relative accuracy of two significant digits. heidel.diag also implements a convergence diagnostic, and removes up to half the chain in order to ensure that the means are estimated from a chain that has converged.
+
+```{r}
+heidel.diag(ratsfit.mcmc)
+```
+
+##Effective Size
+$ESS=\frac{n}{1+s\sum_{k=1}^{\infty}\rho(k)}$ where n is the number of samples and $\rho(k)$ is the correlation at lag k. This behaves well in the extremes. If your samples are independent, your effective samples size equals the actual sample size. If the correlation at lag k decreases extremely slowly, so slowly that the sum in the denominator diverges, your effective sample size is zero.
+```{r}
+effectiveSize(ratsfit.mcmc)
+```
+
+
+#All in one pdf
+```{r}
+report = ggs(ratsfit.mcmc)
+ggmcmc(report)
+```
+
+
+##Monitoring other random quantities
+You can only monitor random quantites which are named in the model file.
+Suppose we want to monitor the mean weight at birth, $\bar{y_0}=\frac{1}{n}\sum_{i=1}^{n}(\alpha_i-\beta_i*\bar{x})$.
+```{r}
+modelstring <- "
+model {
+    # Model
+    for (i in 1:N) {
+        for (j in 1:T) {
+            mu[i, j] <- alpha[i] + beta[i] * (x[j] - x.bar);
+            Y[i,j] ~ dnorm(mu[i,j], tau.c)
+        }
+        alpha[i] ~ dnorm(alpha.c, tau.alpha);
+        beta[i]  ~ dnorm(beta.c, tau.beta);
+    }
+
+    # Priors
+    alpha.c   ~ dnorm(0, 1.0E-4);
+    beta.c    ~ dnorm(0, 1.0E-4);
+    tau.c     ~ dgamma(1.0E-3, 1.0E-3);
+    tau.alpha ~ dgamma(1.0E-3, 1.0E-3);
+    tau.beta  ~ dgamma(1.0E-3, 1.0E-3);
+
+    # Transformations
+    sigma.alpha  <- 1.0/sqrt(tau.alpha);
+    sigma.beta <- 1.0/sqrt(tau.beta);
+    sigma.c    <- 1.0/sqrt(tau.c);
+    x.bar    <- mean(x[]);
+    alpha0   <- alpha.c - beta.c*x.bar
+    ybar0 <- mean(alpha - beta * mean(x));
+}
+"
+
+writeLines(modelstring, "model_monitor.bug")
+```
+
+
+```{r}
+## here we re-do the steps above, note the burn-in
+myrats <- jags.model("model_monitor.bug", data = Data, n.chains = 4,
+quiet = TRUE)
+update(myrats, n.iter = 3000) # burn-in
+rsam <- coda.samples(myrats, "ybar0", n.iter = 1000)
+foo <- summary(rsam)
+print(foo)
+```
+
+So the expected mean birthweight is $106.6\pm 2*0.024$ grams.
+
+#Density of
+$\bar{y}_0$
+```{r}
+#### plot the marginal posterior PDF for ybar0
+densplot(rsam, lwd = 2)
+```
+
+We can see from the PDF that the marginal posterior PDF of $\bar{y}_0$ is approximately bell-shaped (very approximately!), and hence approximately Normal. This is not unusual; in fact, it is a Theorem that, under certain conditons, including lots of observations, the posterior PDF is approximately Multinormal, which implies that the margins are approximately Normal. Note that often these conditions do not hold, but it is always gratifying to see a bell-shaped posterior PDF.
+
+##New Model
+Rats: a normal hierarchical model with exponential expected value
+\[Y_{ij}\sim Norm(\mu_{ij},\tau_c)\]
+\[\mu_{ij}\sim\alpha_i+\beta_i \gamma^{(x_j-\bar{x})}\]
+\[\tau_c\sim Gamma(0.001,0.001)\]
+\[\alpha_i\sim Norm(\alpha_c,\tau_{\alpha})\]
+\[\beta_i\sim Norm(\beta_c,\tau_{\beta})\]
+\[\alpha_c\sim Norm(0,10^{-4})\]
+\[\beta_c\sim Norm(0,10^{-4})\]
+\[\tau_{\alpha}\sim Gamma(0.001,0.001)\]
+\[\tau_{\beta}\sim Gamma(0.001,0.001)\]
+\[\gamma_{i}\sim Unif(0,1)\]
+
+```{r}
+modelstring <- "model {
+	for (i in 1:N) {
+
+		for (j in 1:T) {
+
+			mu[i,j] <- alpha[i] - beta[i]*gamma[i]^(x[j] - x.bar);
+			Y[i,j]   ~ dnorm(mu[i,j],tau.c) }
+
+		alpha[i] ~ dnorm(alpha.c,tau.alpha);
+		beta[i]  ~ dnorm(beta.c,tau.beta);
+		gamma[i] ~ dunif(0.5, 1); }
+
+	alpha.c   ~ dnorm(0,1.0E-4);
+	beta.c    ~ dnorm(0,1.0E-4);
+	tau.c     ~ dgamma(1.0E-3,1.0E-3);
+	tau.alpha ~ dgamma(1.0E-3,1.0E-3);
+	tau.beta  ~ dgamma(1.0E-3,1.0E-3);
+	sigma    <- 1.0/sqrt(tau.c);
+	x.bar    <- mean(x[]); }
+"
+
+writeLines(modelstring, "model_exp.txt")
+```
+
+```{r}
+## Name the JAGS parameters
+
+rats.params_exp <- c("tau.c", "alpha.c", "tau.alpha", "tau.beta", "beta.c", "alpha", "beta", "gamma", "sigma")
+
+## Define the starting values for JAGS
+rats.inits_exp <- function(){
+  list("alpha" =c(250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 
+250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 
+250, 250, 250, 250, 250), 
+"beta" =c(6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 
+6, 6, 6, 6, 6, 6, 6, 6, 6, 6),
+"alpha.c" =c(0),
+"beta.c" =c(2),
+"tau.c" =c(1),
+"tau.alpha" =c(1),
+"tau.beta" =c(1),
+"gamma" =c(0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5,
+    0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5,
+    0.5, 0.5))}
+
+## Fit the model in JAGS, having previously copied the BUGS model in my working directory as "rats.model.jags"
+ratJags_exp <- jags(data=Data,
+                inits=rats.inits_exp,
+                parameters.to.save = rats.params_exp,
+                model.file="model_exp.txt", 
+                n.chains=nc,
+                n.thin = 1,
+                n.iter=ni,
+                n.burnin =nb)
+
+alphaVect_exp = ratJags_exp$BUGSoutput$mean$alpha
+betaVect_exp = ratJags_exp$BUGSoutput$mean$beta
+alphaC_exp = as.vector(ratJags_exp$BUGSoutput$mean$alpha.c)
+betaC_exp = as.vector(ratJags_exp$BUGSoutput$mean$beta.c)
+gamma_exp = ratJags_exp$BUGSoutput$mean$gamma
+xBar_exp = mean(Data$x)
+```
+
+To see how the new model behaves, we always use rat 3, the rat that it seemed to have an exponential behaviour. The first thing we will do, it will be looking at the histograms of alpha[3], beta[3] and gamma[3] chains. This way we will be comparing modes and expected values.
+```{r}
+calc_moda = function(vattore){
+  z <- density(vattore)
+  return(z$x[z$y==max(z$y)])}
+
+calc_MoreMode = function(vetofvett){
+  foriter=dim(vetofvett)[2]
+  modeVect = rep(0, foriter)
+  for (i in 1:foriter) {
+    modeVect[i]=calc_moda(vetofvett[,i]) }
+  return(modeVect)}
+```
+
+Alpha:
+```{r}
+i = 3
+
+cols = 1:30
+#ratJags_exp$BUGSoutput$sims.matrix[1,cols]
+alphaChain1 = ratJags_exp$BUGSoutput$sims.matrix[1:nsim,cols]
+alphaChain2 = ratJags_exp$BUGSoutput$sims.matrix[(nsim+1):(nsim*2),cols]
+alphaChain = ratJags_exp$BUGSoutput$sims.matrix[,cols]
+alphaVectExp_i_mode = calc_MoreMode(alphaChain)
+
+threeHistMY(alphaChain1[,i],alphaChain2[,i],alphaChain[,i],mean(alphaChain1[,i]),mean(alphaChain2[,i]),alphaVect_exp[i],T,alphaVectExp_i_mode[i],paste('all chains of alpha_',i,sep=""),paste('alpha_',i,sep=""))
+
+text(x=520,y=0.020, labels ="green : mode")
+text(x=520,y=0.022, labels ="blue : mean")
+```
+
+Beta:
+```{r}
+cols = 32:61
+#ratJags_exp$BUGSoutput$sims.matrix[1,cols]
+betaChain1 = ratJags_exp$BUGSoutput$sims.matrix[1:nsim,cols]
+betaChain2 = ratJags_exp$BUGSoutput$sims.matrix[(nsim+1):(nsim*2),cols]
+betaChain = ratJags_exp$BUGSoutput$sims.matrix[,cols]
+betaVectExp_i_mode = calc_MoreMode(betaChain)
+
+threeHistMY(betaChain1[,i],betaChain2[,i],betaChain[,i],mean(betaChain1[,i]),mean(betaChain2[,i]),betaVect_exp[i],T,betaVectExp_i_mode[i],paste('all chains of beta_',i,sep=""),paste('beta_',i,sep=""))
+
+text(x=250,y=0.020, labels ="green : mode")
+text(x=250,y=0.022, labels ="blue : mean")
+```
+
+Gamma:
+```{r}
+cols = 64:93
+#ratJags_exp$BUGSoutput$sims.matrix[1,cols]
+gammaChain1 = ratJags_exp$BUGSoutput$sims.matrix[1:nsim,cols]
+gammaChain2 = ratJags_exp$BUGSoutput$sims.matrix[(nsim+1):(nsim*2),cols]
+gammaChain = ratJags_exp$BUGSoutput$sims.matrix[,cols]
+gammaExp_i_mode = calc_MoreMode(gammaChain)
+
+threeHistMY(gammaChain1[,i],gammaChain2[,i],gammaChain[,i],mean(gammaChain1[,i]),mean(gammaChain2[,i]),gamma_exp[i],T,gammaExp_i_mode[i],paste('all chains of gamma_',i,sep=""),paste('gamma_',i,sep=""))
+
+text(x=0.975,y=100, labels ="green : mode")
+text(x=0.975,y=110, labels ="blue : mean")
+```
+
+As we can see each plot has always 3 histograms, 2 different chains for the same parameter and an overall one. Like before those 3 histograms are similar, but now the mode and the expected value are not equal. We can compute the curve for rat 3 both with the expected values and mode of the overall chain.
+```{r}
+i = 3
+
+plot(Data$x,Data$Y[i,],m=paste("rat_",i,sep=""), ylab='weigth', xlab='days')
+abline(a = alphaVect[i]-betaVect[i]*xBar, b=betaVect[i], col='red', lty='dashed',lw=1)
+lines(Data$x,alphaVect_exp[i]-betaVect_exp[i]*gamma_exp[i]^(Data$x-xBar),col="green",lw=2)
+lines(Data$x,alphaVectExp_i_mode[i]-betaVectExp_i_mode[i]*gammaExp_i_mode[i]^(Data$x-xBar),col="blue",lty='dotted',lw=2)
+
+text(x=27,y=200, labels ="green line : MCMC exp model - means - R2 = 0.9867631")
+text(x=27,y=190,label ='red line : MCMC linear model - R2 = 0.9632383')
+text(x=27,y=210,label ='blue line : MCMC exp model - modes - R2 = 0.9830632')
+```
+
+The green that uses expected values looks more precise. To be sure we can use the coefficient of determination R2, which the more is close to 1 the less are the difference between the data Y and the approximation given by the curve.
+```{r}
+calc_R2all_exp = function(uailol,a,b,g,xlol,xBarlol){
+  R2tutti<-rep(0, 30)
+  R2tuttiNames<-rep(0, 30)
+  for (i in 1:30) {
+    SSreg = sum((uailol[i,]-(a[i]-b[i]*g[i]^(xlol-xBarlol)))^2)
+    SStot = sum((uailol[i,]-mean(uailol[i,]))^2)
+    R2tuttiNames[i] = paste('rat', i, sep = "")
+    R2tutti[i] = 1 - SSreg/SStot }
+  names(R2tutti) = R2tuttiNames
+  return(R2tutti)}
+```
+
+```{r}
+R2all_Exp_i = calc_R2all_exp(Data$Y,alphaVect_exp,betaVect_exp,gamma_exp,Data$x,xBar)
+R2all_Exp_i_mode = calc_R2all_exp(Data$Y,alphaVectExp_i_mode,betaVectExp_i_mode,gammaExp_i_mode,Data$x,xBar)
+
+R2all[3]
+R2all_Exp_i[3]
+R2all_Exp_i_mode[3]
+
+```
+
+The results show a better performance of the exponential model in approximating the rat 3 as both R2 for the modes and for the expected values are greater than the R2 from the past linear model. Let's also compute the average R2 for all rats.
+```{r}
+mean(R2all)
+mean(R2all_Exp_i)
+mean(R2all_Exp_i_mode)
+```
+
+The difference between the linear and the exponential model is now not as great. We will come back on the perfomance of the model later.
+
+##Comparing Models
+What I understood by running the different models, was that the performance really changed by varying the number of iterations and the percentage of burn-in. A correct measure to analyse the performance of the model is to use the measure DIC. Such measure is the deviance information criterion and it uses the deviance measure. The deviance D gives, given a parameter value $\theta$, some kind of error using the log-likelihood function: $D(\theta)=-2logL(\theta)$
+Once the posterior means $\bar{\theta}$ are computed, you can measure their deviance as: $D(\bar{\theta})=-2logL(\bar{\theta})$
+Taking all steps in the different MCMCs gives a vector of parameters $\theta_i$ with which a $D(\theta_i)$ can be computed. By taking all $D(\theta_i)$ it is possible to compute an average called posterior mean of the deviance as follows: $\bar{D}=\frac{1}{t}\sum_{i=1}^{t}D(\theta_i)$
+It is now possible to compute the effective numbers of parameters $p_D$ in the model as follows: $p_D=\bar{D}-D(\bar{\theta})$
+Then the DIC is computed as follows: $DIC=D(\bar{\theta})+2p_D$ and we can use it to measure the performance of models in terms of uncertainty of the results.
+Given a model $M_1$ and a model $M_2$, $M_1$ is better than $M_2$ if: $DIC_1<DIC_2$.
+
+```{r}
+## collect DIC values for the current model
+myrats <- jags.model("model.txt", data = Data, n.chains = 2,quiet = TRUE)
+update(myrats, n.iter = 3000)
+dic1 <- dic.samples(myrats, n.iter = 1000, type = "pD")
+dic1
+
+
+## collect DIC from new model
+myrats2 <- jags.model("model_exp.txt", data = Data, n.chains = 2,
+quiet = TRUE)
+update(myrats2, n.iter = 3000)
+dic2 <- dic.samples(myrats2, n.iter = 1000, type = "pD")
+dic2
+```
+
+Now we compare the two DICs. A small value is better, so if dic1 - dic2 is negative, then the original model is better, and if it is positive then the new model is better.
+```{r}
+## compare the DICs
+diffdic(dic1, dic2) # could also do dic1 - dic2
+```
+
+This is negative: so the original model is better.
+
+But What if I change the number of iterations?
+```{r}
+iter_vect <-c(5000,10000,50000,100000)
+pos = 1
+for (i in iter_vect){
+## collect DIC values for the current model
+myrats <- jags.model("model.txt", data = Data, n.chains = 2,quiet = TRUE)
+update(myrats, n.iter = i)
+dic1 <- dic.samples(myrats, n.iter = i/2, type = "pD")
+
+## collect DIC from new model
+myrats2 <- jags.model("model_exp.txt", data = Data, n.chains = 2,
+quiet = TRUE)
+update(myrats2, n.iter = i)
+dic2 <- dic.samples(myrats2, n.iter = i/2, type = "pD")
+
+print(diffdic(dic1, dic2) )# could also do dic1 - dic2
+
+pos = pos + 1
+}
+```
+
+We can see that as the number of iterations get bigger, the new model is better.
